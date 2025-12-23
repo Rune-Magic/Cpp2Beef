@@ -1,0 +1,5 @@
+FileVersion = 1
+Projects = {Cpp2Beef = {Path = "."}, "Clang-Beef.git" = {Git = "https://github.com/Rune-Magic/Clang-Beef.git"}}
+
+[Workspace]
+StartupProject = "Cpp2Beef"

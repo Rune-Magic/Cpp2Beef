@@ -1,0 +1,6 @@
+FileVersion = 1
+Dependencies = {corlib = "*", "Clang-Beef.git" = {Git = "https://github.com/Rune-Magic/Clang-Beef.git"}}
+
+[Project]
+Name = "Cpp2Beef"
+StartupObject = "Cpp2Beef.Program"
