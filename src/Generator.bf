@@ -507,6 +507,7 @@ abstract class Cpp2BeefGenerator
 		WriteCustomAttributes(cursor);
 		if (mangledName == name)
 			str.Append("[CLink] ");
+		//!!!!!! disabled for asthetics
 		//else
 		//	str.Append("[LinkName(\"", mangledName, "\")] ");
 	}
@@ -531,7 +532,7 @@ abstract class Cpp2BeefGenerator
 		}
 	}
 
-	protected virtual void WriteTypeAndName(CXCursor cursor, CXType type)
+	protected virtual void WriteTypeAndName(CXCursor cursor, CXType type, enum { Standard, TypeAlias, ConversionFunction, Ctor, Dtor } format = .Standard)
 	{
 		Flush();
 		AllWhiteSpaceBetween(
@@ -542,8 +543,31 @@ abstract class Cpp2BeefGenerator
 		str.Clear();
 		Type(type);
 		whitespace.Length -= Math.Min(str.Length, whitespace.Length);
-		str.Append(whitespace.IsEmpty ? " " : whitespace);
-		GetNameInBindings(cursor, str);
+		if (whitespace.IsEmpty) whitespace.Append(' ');
+		switch (format)
+		{
+		case .Standard:
+			str.Append(whitespace);
+			GetNameInBindings(cursor, str);
+		case .TypeAlias:
+			String typeStr = scope .(str);
+			str.Clear();
+			GetNameInBindings(cursor, str);
+			str.Append(whitespace, "= ", typeStr);
+		case .ConversionFunction:
+			String typeStr = scope .(str);
+			str.Clear();
+			str.Append("operator", whitespace, typeStr);
+		case .Ctor, .Dtor:
+			let originalLen = GetCursorSpelling!(cursor).Length;
+			StringView beefName = _ == .Ctor ? "this" : "~this";
+			int change = beefName.Length - originalLen;
+			if (change > 0)
+				whitespace.Length -= change;
+			else
+				str.Append(' ', -change);
+			str.Append(beefName);
+		}
 	}
 
 	protected mixin ScopeTokenize(CXCursor cursor)
@@ -738,9 +762,11 @@ abstract class Cpp2BeefGenerator
 			Attributes();
 			AccessSpecifier(cursor);
 			str.Append("static extern ");
-			GetNameInBindings(cursor, str);
+			WriteTypeAndName(cursor, Clang.GetCursorResultType(cursor),
+				cursor.kind == .ConversionFunction ? .ConversionFunction : .Standard);
 			str.Append("(in Self, ");
 			Method_Parameters(cursor);
+			if (str.EndsWith(", ")) str.Length -= 2;
 			str.Append(");");
 			return;
 		}
@@ -751,8 +777,8 @@ abstract class Cpp2BeefGenerator
 		str.Append("extern ");
 		switch (cursor.kind)
 		{
-		case .Constructor: str.Append("this");
-		case .Destructor: str.Append("~this");
+		case .Constructor: WriteTypeAndName(cursor, .() { kind = .Void }, .Ctor);
+		case .Destructor: WriteTypeAndName(cursor, .() { kind = .Void }, .Dtor);
 		case .CXXMethod:
 			WriteTypeAndName(cursor, Clang.GetCursorResultType(cursor));
 		default:
@@ -768,7 +794,7 @@ abstract class Cpp2BeefGenerator
 		WriteCustomAttributes(cursor);
 		AccessSpecifier(cursor);
 		WriteTypeAndName(cursor, Clang.GetCursorType(cursor));
-		str.Append(";");
+		str.Append(';');
 	}
 
 	protected virtual void VarDecl(CXCursor cursor)
@@ -919,9 +945,7 @@ abstract class Cpp2BeefGenerator
 
 		WriteCustomAttributes(cursor);
 		str.Append("typealias ");
-		GetNameInBindings(cursor, str);
-		str.Append(" = ");
-		Type(type);
+		WriteTypeAndName(cursor, type, .TypeAlias);
 		str.Append(';');
 	}
 
