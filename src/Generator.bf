@@ -12,7 +12,6 @@ abstract class Cpp2BeefGenerator
 	protected abstract Span<char8*> Args { get; }
 	protected abstract StreamWriter GetWriterForHeader(StringView header);
 
-	protected virtual StringView Spacing => " ";
 	protected virtual bool IndentBlocks => true;
 
 	protected virtual void GetNameInBindings(CXCursor cursor, String outString)
@@ -257,6 +256,25 @@ abstract class Cpp2BeefGenerator
 		str.Append(indent);*/
 	}
 
+	protected virtual void AllWhiteSpaceUntil(CXSourceLocation from)
+	{
+		StringView file;
+		{
+			Clang.GetSpellingLocation(from, let cxfile, ?, ?, ?);
+			char8* ptr = Clang.GetFileContents(unit, cxfile, let size);
+			file = .(ptr, (.)size);
+		}
+
+		for (int i = from.int_data; i >= 0; i--)
+		{
+			char8 c = file[i];
+			if (c.IsWhiteSpace)
+				str.Append(c);
+			else if (c != '/' && c != '*')
+				break;
+		}
+	}
+
 	protected virtual void WriteComments(CXCursor cursor)
 	{
 		if (cursor.kind == .MacroDefinition) return;
@@ -282,7 +300,7 @@ abstract class Cpp2BeefGenerator
 		Span<CXToken> tokens = .(tokenPtr, tokenCount);
 
 		uint32 line = prevLine;
-		mixin WriteLinesUntil(uint32 targetLine)
+		mixin WriteLinesUntil(uint32 targetLine, CXSourceLocation from)
 		{
 			int numNewLines = targetLine - line;
 			for (let i < numNewLines)
@@ -298,11 +316,11 @@ abstract class Cpp2BeefGenerator
 				if (unitMacros.TryGet(.(line, curFile), ?, let macro))
 				{
 					WriteCursor(macro, canChangeBlock: true, macro: true);
-					if (i+1 == numNewLines) str.Append(Spacing);
+					if (i+1 == numNewLines) str.Append(' ');
 				}
 			}
 			if (numNewLines == 0)
-				str.Append(Spacing);
+				AllWhiteSpaceUntil(from);
 			else
 				str.Append(indent);
 		}
@@ -315,7 +333,7 @@ abstract class Cpp2BeefGenerator
 			let end = Clang.GetRangeStart(extent);
 			Clang.GetSpellingLocation(start, ?, let startLine, ?, ?);
 			Clang.GetSpellingLocation(end, ?, let endLine, ?, ?);
-			WriteLinesUntil!(startLine);
+			WriteLinesUntil!(startLine, start);
 			for (let c in ScopeCXString!(Clang.GetTokenSpelling(unit, token)))
 			{
 				str.Append(c);
@@ -327,7 +345,7 @@ abstract class Cpp2BeefGenerator
 			}
 			Flush();
 		}
-		WriteLinesUntil!(curLine);
+		WriteLinesUntil!(curLine, curStart);
 	}
 
 	protected virtual bool DocString(CXCursor cursor)
@@ -381,8 +399,8 @@ abstract class Cpp2BeefGenerator
 			Type(pointee);
 			if (pointee.kind != .FunctionProto && pointee.kind != .FunctionNoProto)
 				str.Append('*');
-		case .LValueReference: str.Append("ref "); Type(Clang.GetNonReferenceType(type));
-		case .RValueReference: str.Append("in "); Type(Clang.GetNonReferenceType(type));
+		case .LValueReference: str.Append( "in "); Type(Clang.GetNonReferenceType(type));
+		case .RValueReference: str.Append("ref "); Type(Clang.GetNonReferenceType(type));
 		case .Record: PossiblyAnon(=> Record);
 		case .Enum: PossiblyAnon(=> Enum);
 		case .Typedef:
@@ -489,8 +507,8 @@ abstract class Cpp2BeefGenerator
 		WriteCustomAttributes(cursor);
 		if (mangledName == name)
 			str.Append("[CLink] ");
-		else
-			str.Append("[LinkName(\"", mangledName, "\")] ");
+		//else
+		//	str.Append("[LinkName(\"", mangledName, "\")] ");
 	}
 
 	protected virtual void Method_Parameters(CXCursor cursor)
@@ -513,6 +531,21 @@ abstract class Cpp2BeefGenerator
 		}
 	}
 
+	protected virtual void WriteTypeAndName(CXCursor cursor, CXType type)
+	{
+		Flush();
+		AllWhiteSpaceBetween(
+			Clang.GetRangeStart(Clang.GetCursorExtent(cursor)),
+			Clang.GetRangeStart(Clang.Cursor_GetSpellingNameRange(cursor, 0, 0))
+		);
+		String whitespace = scope .(str);
+		str.Clear();
+		Type(type);
+		whitespace.Length -= Math.Min(str.Length, whitespace.Length);
+		str.Append(whitespace.IsEmpty ? " " : whitespace);
+		GetNameInBindings(cursor, str);
+	}
+
 	protected mixin ScopeTokenize(CXCursor cursor)
 	{
 		let range = Clang.GetCursorExtent(cursor);
@@ -522,27 +555,83 @@ abstract class Cpp2BeefGenerator
 		Span<CXToken>(tokenPtr, (.)tokenCount)
 	}
 
-	protected void WriteTokensAfterEquals(CXCursor cursor)
+	protected virtual void WriteTokensAfterEquals(CXCursor cursor)
 	{
 		var tokens = ScopeTokenize!(cursor);
+		CXSourceLocation prevEnd = Clang.GetNullLocation();
 		findEquals: do
 		{
 			for (let token in tokens)
 			{
 				let spelling = GetTokenSpelling!(token);
-				if (spelling != "=") continue;
+				if (spelling != "=")
+				{
+					prevEnd = Clang.GetRangeEnd(Clang.GetTokenExtent(unit, token));
+					continue;
+				}
 				tokens.RemoveFromStart(@token.Index);
 				break findEquals;
 			}
 			return;
 		}
-		WriteTokens(tokens, .Identifier);
+		WriteTokens(tokens, prevEnd, .Identifier);
 	}
 
-	protected virtual void WriteTokens(Span<CXToken> tokens, CXTokenKind prev)
+	protected void AllWhiteSpaceBetween(CXSourceLocation start, CXSourceLocation end)
 	{
+		if (Clang.EqualLocations(start, Clang.GetNullLocation()) != 0 ||
+			Clang.EqualLocations(end, Clang.GetNullLocation()) != 0) return;
+
+		StringView file;
+		{
+			Clang.GetSpellingLocation(start, let cxfile, ?, ?, ?);
+			char8* ptr = Clang.GetFileContents(unit, cxfile, let size);
+			file = .(ptr, (.)size);
+		}
+
+		for (int i = start.int_data; i < end.int_data; i++)
+		{
+			char8 c = file[i];
+			str.Append(c.IsWhiteSpace ? c : ' ');
+		}
+	}
+
+	protected virtual void WriteToken(CXToken token)
+	{
+		let spelling = ScopeCXString!(Clang.GetTokenSpelling(unit, token));
+		let kind = Clang.GetTokenKind(token);
+		token: switch (kind)
+		{
+		case .Literal:
+			str.Append(spelling);
+			if (str.EndsWith("LL"))
+			str.Length--;
+		case .Identifier:
+			var cursor = Clang.GetCursor(unit, Clang.GetTokenLocation(unit, token));
+			if (Clang.Cursor_IsNull(cursor) != 0) fallthrough;
+			cursor = Clang.GetCursorDefinition(cursor);
+			if (Clang.Cursor_IsNull(cursor) != 0) fallthrough;
+			GetNameInBindings(cursor, str);
+		case .Punctuation, .Comment, .Keyword:
+			str.Append(spelling);
+		}
+	}
+
+	protected virtual void WriteTokens(Span<CXToken> tokens, CXSourceLocation prevTokenEnd, CXTokenKind prevKind)
+	{
+		var prevTokenEnd;
+		for (let token in tokens)
+		{
+			let extent = Clang.GetTokenExtent(unit, token);
+			AllWhiteSpaceBetween(prevTokenEnd, Clang.GetRangeStart(extent));
+			WriteToken(token);
+			prevTokenEnd = Clang.GetRangeEnd(extent);
+		}
+
+		//TODO: move to custom utils
+		/* // This formats the tokens instead of copying the format 1:1
 		const CXTokenKind Unary = (.)-1;
-		var prev;
+		var prevKind;
 		for (let token in tokens)
 		{
 			let spelling = ScopeCXString!(Clang.GetTokenSpelling(unit, token));
@@ -550,7 +639,7 @@ abstract class Cpp2BeefGenerator
 			token: switch (kind)
 			{
 			case .Keyword, .Identifier, .Literal:
-				if (prev == .Keyword || prev == .Identifier || prev == .Punctuation)
+				if (prevKind == .Keyword || prevKind == .Identifier || prevKind == .Punctuation)
 					str.Append(' ');
 				if (kind == .Identifier) do
 				{
@@ -566,19 +655,19 @@ abstract class Cpp2BeefGenerator
 					str.Length--;
 			case .Punctuation:
 				defer str.Append(spelling);
-				if (prev != Unary && !(spelling == "(" && prev != .Punctuation) && spelling != ")")
+				if (prevKind != Unary && !(spelling == "(" && prevKind != .Punctuation) && spelling != ")")
 				{
 					if (spelling != ",")
 						str.Append(' ');
-					if (prev != .Punctuation)
+					if (prevKind != .Punctuation)
 						break;
 				}
-				prev = Unary;
+				prevKind = Unary;
 				continue;
 			case .Comment:
 			}
-			prev = kind;
-		}
+			prevKind = kind;
+		}*/
 	}
 
 	protected virtual void Namespace(CXCursor cursor)
@@ -608,15 +697,13 @@ abstract class Cpp2BeefGenerator
 		Linkable_Attributes(cursor);
 		AccessSpecifier(cursor);
 		str.Append("static extern ");
-		Type(Clang.GetCursorResultType(cursor));
-		str.Append(Spacing);
-		GetNameInBindings(cursor, str);
+		WriteTypeAndName(cursor, Clang.GetCursorResultType(cursor));
 		str.Append('(');
 		Method_Parameters(cursor);
 		str.Append(");");
 	}
 
-	protected virtual void CXXMethod(CXCursor cursor)
+	protected virtual void CXXMethod(CXCursor cursor) //TODO: conversion function
 	{
 		void Attributes()
 		{
@@ -667,9 +754,7 @@ abstract class Cpp2BeefGenerator
 		case .Constructor: str.Append("this");
 		case .Destructor: str.Append("~this");
 		case .CXXMethod:
-			Type(Clang.GetCursorResultType(cursor));
-			str.Append(Spacing);
-			GetNameInBindings(cursor, str);
+			WriteTypeAndName(cursor, Clang.GetCursorResultType(cursor));
 		default:
 			Runtime.FatalError("Unhandled c++ method kind");
 		}
@@ -682,9 +767,7 @@ abstract class Cpp2BeefGenerator
 	{
 		WriteCustomAttributes(cursor);
 		AccessSpecifier(cursor);
-		Type(Clang.GetCursorType(cursor));
-		str.Append(Spacing);
-		GetNameInBindings(cursor, str);
+		WriteTypeAndName(cursor, Clang.GetCursorType(cursor));
 		str.Append(";");
 	}
 
@@ -697,18 +780,14 @@ abstract class Cpp2BeefGenerator
 		case .Internal when Clang.IsConstQualifiedType(type) != 0:
 			AccessSpecifier(cursor);
 			str.Append("const ");
-			Type(Clang.GetCursorType(cursor));
-			str.Append(Spacing);
-			GetNameInBindings(cursor, str);
+			WriteTypeAndName(cursor, Clang.GetCursorType(cursor));
 			WriteTokensAfterEquals(cursor);
 			str.Append(";");
 		case .External, .UniqueExternal:
 			Linkable_Attributes(cursor);
 			AccessSpecifier(cursor);
 			str.Append("static extern ");
-			Type(Clang.GetCursorType(cursor));
-			str.Append(Spacing);
-			GetNameInBindings(cursor, str);
+			WriteTypeAndName(cursor, Clang.GetCursorType(cursor));
 			str.Append(";");
 		default:
 			Runtime.FatalError(scope $"Unhandled var linkage: {_}");
@@ -756,7 +835,7 @@ abstract class Cpp2BeefGenerator
 
 			Runtime.Assert(Clang.IsVirtualBase(cursor) == 0, "Virtual bases are not supported");
 			if (*firstBase && hasVTable && !HasVTable(Clang.GetCursorDefinition(cursor)))
-				self.str.Append(self.indent, "private void*", self.Spacing, "cppVtable;\n");
+				self.str.Append(self.indent, "private void* cppVtable;\n");
 			self.str.Append(self.indent);
 			self.AccessSpecifier(cursor);
 			self.str.Append("using ");
@@ -768,7 +847,7 @@ abstract class Cpp2BeefGenerator
 		}, &(this, &firstBase, hasVTable));
 
 		if (firstBase && hasVTable)
-			str.Append(indent, "private void*", Spacing, "cppVtable;\n");
+			str.Append(indent, "private void* cppVtable;\n");
 
 		Clang.VisitChildren(cursor, (cursor, parent, client_data) =>
 		{
@@ -832,9 +911,7 @@ abstract class Cpp2BeefGenerator
 				break;
 			WriteCustomAttributes(cursor);
 			str.Append("function ");
-			Type(Clang.GetResultType(pointee));
-			str.Append(' ');
-			GetNameInBindings(cursor, str);
+			WriteTypeAndName(cursor, Clang.GetResultType(pointee));
 			WriteFunctionProtoParams(pointee);
 			str.Append(';');
 			return;
@@ -843,7 +920,7 @@ abstract class Cpp2BeefGenerator
 		WriteCustomAttributes(cursor);
 		str.Append("typealias ");
 		GetNameInBindings(cursor, str);
-		str.Append(Spacing, "= ");
+		str.Append(" = ");
 		Type(type);
 		str.Append(';');
 	}
@@ -854,8 +931,9 @@ abstract class Cpp2BeefGenerator
 		WriteCustomAttributes(cursor);
 		str.Append("public const let ");
 		GetNameInBindings(cursor, str);
-		str.Append(Spacing, "=");
-		WriteTokens(tokens[1...], .Punctuation);
+		AllWhiteSpaceBetween(Clang.GetRangeEnd(Clang.GetTokenExtent(unit, tokens[0])), Clang.GetRangeStart(Clang.GetTokenExtent(unit, tokens[1])));
+		str.Append("= ");
+		WriteTokens(tokens[1...], Clang.GetNullLocation(), .Punctuation);
 		str.Append(';');
 	}
 }
