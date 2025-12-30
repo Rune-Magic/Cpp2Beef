@@ -6,3 +6,5 @@ BeefSpace_User.toml
 src/Program.bf
 ImGui.bf
 inheritance.hpp
+wrapper.cpp
+wrapper.o
