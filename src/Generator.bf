@@ -15,7 +15,30 @@ abstract class Cpp2BeefGenerator
 	protected virtual bool IndentBlocks => true;
 
 	protected virtual void GetNameInBindings(CXCursor cursor, String outString)
-		=> Compiler.Identifier.GetSourceName(GetCursorSpelling!(cursor), outString);
+	{
+		let spelling = GetCursorSpelling!(cursor);
+		getName: switch (cursor.kind)
+		{
+		case .TypedefDecl:
+			switch (spelling)
+			{
+			case "size_t": outString.Append("c_size");
+			case "wchar_t": outString.Append("c_wchar");
+			case "va_list": outString.Append("VarArgs");
+			case "int8_t": outString.Append("int8");
+			case "int16_t": outString.Append("int16");
+			case "int32_t": outString.Append("int32");
+			case "int64_t": outString.Append("int64");
+			case "uint8_t": outString.Append("uint8");
+			case "uint16_t": outString.Append("uint16");
+			case "uint32_t": outString.Append("uint32");
+			case "uint64_t": outString.Append("uint64");
+			default: fallthrough getName;
+			}
+		default:
+			Compiler.Identifier.GetSourceName(spelling, outString);
+		}
+	}
 
 	enum AttrFlags { None = 0, Packed = 1, NoDiscard = 2 }
 	protected virtual void WriteCustomAttributes(CXCursor cursor)
@@ -52,7 +75,7 @@ abstract class Cpp2BeefGenerator
 		{
 		case .MacroDefinition:
 			if (Clang.Cursor_IsMacroFunctionLike(cursor) != 0) return .SkipCursor;
-			let tokens = ScopeTokenize!(cursor);
+			let tokens = ScopeTokenize!(cursor, unit);
 			if (tokens.Length <= 1) return .SkipCursor;
 		case .CXXMethod, .Constructor, .Destructor, .ConversionFunction:
 			if (Clang.EqualCursors(Clang.GetCursorLexicalParent(cursor), Clang.GetCursorSemanticParent(cursor)) == 0)
@@ -96,6 +119,10 @@ abstract class Cpp2BeefGenerator
 
 	private StreamWriter currentWritter;
 	private StreamWriter wrapperWritter;
+
+	private append String wrapperTemplateChain = .(16);
+	private append String templateParams = .(16);
+	private append String templateParamsWhere = .(64);
 
 	private struct UnitMacroIndex : this(uint32 line, CXFile file), IHashable
 	{
@@ -242,7 +269,7 @@ abstract class Cpp2BeefGenerator
 			if (!canChangeBlock || block != "static") return;
 			block.Set("");
 			if (IndentBlocks) indent.Length--;
-			str.Append(indent, "\n}");
+			str.Append("\n", indent, "}");
 			newLineAfterCurrent = true;
 		}
 
@@ -266,6 +293,38 @@ abstract class Cpp2BeefGenerator
 			}
 		}
 
+		var cursor;
+		templateParams.Clear();
+		templateParamsWhere.Clear();
+		switch (cursor.kind)
+		{
+		case .FunctionTemplate, .ClassTemplate, .TypeAliasTemplateDecl:
+			templateParams.Append('<');
+			Clang.VisitChildren(cursor, (cursor, parent, client_data) =>
+			{
+				Self self = (.)Internal.UnsafeCastToObject(client_data);
+				switch (cursor.kind)
+				{
+				case .TemplateTypeParameter:
+				case .NonTypeTemplateParameter:
+					self.templateParamsWhere.Append(" where ", GetCursorSpelling!(cursor), " : const ");
+					self.Flush();
+					self.Type(Clang.GetCursorType(cursor));
+					self.templateParamsWhere.Append(self.str);
+					self.str.Clear();
+				case .TemplateTemplateParameter:
+					Runtime.FatalError("C++ template template parameters are not supported");
+				default: return .Continue;
+				}
+				self.templateParams.Append(GetCursorSpelling!(cursor), ", ");
+				return .Continue;
+			}, Internal.UnsafeCastToPtr(this));
+			templateParams.Length -= 2;
+			templateParams.Append('>');
+			cursor.kind = Clang.GetTemplateCursorKind(cursor);
+		default:
+		}
+
 		switch (cursor.kind)
 		{
 		case .StructDecl,
@@ -283,11 +342,7 @@ abstract class Cpp2BeefGenerator
 		case .FieldDecl: StaticBlock(); SingleLine(cursor); WriteComments(cursor); FieldDecl(cursor);
 		case .VarDecl: StaticBlock(); SingleLine(cursor); WriteComments(cursor); VarDecl(cursor);
 
-		case .FunctionTemplate: StaticBlock(); SingleLine(cursor); WriteComments(cursor);
-		case .ClassTemplate: NoBlock(); MultiLine(cursor); WriteComments(cursor);
-		case .TypeAliasTemplateDecl: NoBlock(); SingleLine(cursor); WriteComments(cursor);
-
-		case .InclusionDirective, .MacroExpansion, .CXXBaseSpecifier, .CXXAccessSpecifier: // ignored
+		case .InclusionDirective, .MacroExpansion, .CXXBaseSpecifier, .CXXAccessSpecifier, .LinkageSpec: // ignored
 		default: Debug.WriteLine(scope $"Unhandled cursor: {_}");
 		}
 
@@ -411,7 +466,10 @@ abstract class Cpp2BeefGenerator
 			Flush();
 		}
 		WriteLinesUntil!(curLine, curStart);
+	}
 
+	protected void WriteQueuedOpenSquirly()
+	{
 		if (queuedOpenSquirly)
 		{
 			str.Append("{ ");
@@ -431,21 +489,6 @@ abstract class Cpp2BeefGenerator
 
 	protected virtual void Type(CXType type, enum { None, InParam, OutParam } paramMode = .None)
 	{
-		void PossiblyAnon(function void(Self this, CXCursor) writeDecl)
-		{
-			CXCursor decl = Clang.GetTypeDeclaration(type);
-			if (Clang.Cursor_IsAnonymous(decl) != 0)
-			{
-				writeDecl(this, decl);
-				str.TrimEnd();
-			}
-			else
-			{
-				//Clang.GetTypePrettyPrinted();
-				GetNameInBindings(decl, str);
-			}
-		}
-
 		switch (type.kind)
 		{
 		case .Void: str.Append("void");
@@ -492,37 +535,79 @@ abstract class Cpp2BeefGenerator
 			case .OutParam: str.Append("out ");
 			}
 			Type(nonRefType);
-		case .Record: PossiblyAnon(=> Record);
-		case .Enum: PossiblyAnon(=> Enum);
-		case .Typedef:
-			CXCursor decl = Clang.GetTypeDeclaration(type);
-			let spelling = GetCursorSpelling!(decl);
-			switch (spelling)
-			{
-			case "size_t": str.Append("c_size");
-			case "wchar_t": str.Append("c_wchar");
-			case "va_list": str.Append("VarArgs");
-			case "int8_t": str.Append("int8");
-			case "int16_t": str.Append("int16");
-			case "int32_t": str.Append("int32");
-			case "int64_t": str.Append("int64");
-			case "uint8_t": str.Append("uint8");
-			case "uint16_t": str.Append("uint16");
-			case "uint32_t": str.Append("uint32");
-			case "uint64_t": str.Append("uint64");
-			default: GetNameInBindings(decl, str);
-			}
 		case .FunctionNoProto: str.Append("function "); Type(Clang.GetResultType(type)); str.Append("()");
 		case .FunctionProto: str.Append("function "); Type(Clang.GetResultType(type)); WriteFunctionProtoParams(type);
 		case .ConstantArray: Type(Clang.GetArrayElementType(type)); str.Append('['); Clang.GetArraySize(type).ToString(str); str.Append(']');
 		case .IncompleteArray: Type(Clang.GetArrayElementType(type)); str.Append('*');
 		case .Auto: str.Append("var");
-		case .Elaborated:
-			let named = Clang.Type_GetNamedType(type);
-			if (named.kind != .Unexposed) { Type(named); break; }
-			let unqualified = Clang.GetUnqualifiedType(type);
-			str.Append(ScopeCXString!(Clang.GetTypeSpelling(unqualified)));
-		default: Runtime.FatalError(scope $"Unhandled type kind: {_}");
+		case .Elaborated, .Record, .Enum, .Typedef:
+			CXCursor decl = Clang.GetTypeDeclaration(type);
+			if (Clang.Cursor_IsAnonymous(decl) != 0)
+			{
+				switch (decl.kind)
+				{
+				case .EnumDecl: Enum(decl);
+				case .StructDecl, .ClassDecl, .UnionDecl: Record(decl);
+				default: Runtime.FatalError(scope $"Unhandled anon type: {_}");
+				}
+				break;
+			}
+
+			{
+				String qualified = scope .(256);
+				String buffer = scope .(256);
+				GetNameInBindings(decl, qualified);
+				CXCursor parent = decl;
+				while (true)
+				{
+					parent = Clang.GetCursorSemanticParent(parent);
+					if (Clang.IsDeclaration(parent.kind) == 0 || parent.kind == .LinkageSpec) break;
+					buffer.Clear();
+					switch (parent.kind)
+					{
+					case .FunctionTemplate, .ClassTemplate, .TypeAliasTemplateDecl:
+						GetNameInBindings(parent, buffer);
+						buffer.Append('<');
+						Clang.VisitChildren(parent, (cursor, parent, client_data) =>
+						{
+							String buffer = (.)Internal.UnsafeCastToObject(client_data);
+							switch (cursor.kind)
+							{
+							case .TemplateTypeParameter, .NonTypeTemplateParameter:
+							case .TemplateTemplateParameter:
+								Runtime.FatalError("C++ template template parameters are not supported");
+							default: return .Continue;
+							}
+							buffer.Append(GetCursorSpelling!(cursor), ", ");
+							return .Continue;
+						}, Internal.UnsafeCastToPtr(buffer));
+						buffer.Length -= 2;
+						buffer.Append('>');
+					default:
+						Flush();
+						Type(Clang.GetCursorType(parent));
+						buffer.Append(str);
+						str.Clear();
+					}
+					buffer.Append('.');
+					qualified.Insert(0, buffer);
+				}
+				str.Append(qualified);
+			}
+
+			let numTemplateArgs = Clang.Type_GetNumTemplateArguments(type);
+			if (numTemplateArgs > 0)
+			{
+				str.Append('<');
+				for (let i < numTemplateArgs)
+				{
+					if (i > 0) str.Append(", ");
+					Type(Clang.Type_GetTemplateArgumentAsType(type, (.)i));
+				}
+				str.Append('>');
+			}
+		case .Unexposed: str.Append(ScopeCXString!(Clang.GetTypeSpelling(Clang.GetUnqualifiedType(type)))); // template param
+		default: Runtime.FatalError(scope $"Unhandled type: {_}");
 		}
 	}
 
@@ -530,10 +615,10 @@ abstract class Cpp2BeefGenerator
 	{
 		str.Append('(');
 		let numArgs = Clang.GetNumArgTypes(type);
-		for (uint32 i < (.)numArgs)
+		for (let i < numArgs)
 		{
 			if (i > 0) str.Append(", ");
-			Type(Clang.GetArgType(type, i));
+			Type(Clang.GetArgType(type, (.)i));
 		}
 		if (Clang.IsFunctionTypeVariadic(type) != 0)
 		{
@@ -586,7 +671,7 @@ abstract class Cpp2BeefGenerator
 			else
 			{
 				indent.Length--;
-				str.Append(indent, "\n}");
+				str.Append("\n", indent, "}");
 				newLineAfterCurrent = true;
 			}
 		}
@@ -625,10 +710,10 @@ abstract class Cpp2BeefGenerator
 	protected virtual void Method_Parameters(CXCursor cursor)
 	{
 		let numArgs = Clang.Cursor_GetNumArguments(cursor);
-		for (uint32 i < (.)numArgs)
+		for (let i < numArgs)
 		{
 			if (i > 0) str.Append(", ");
-			let arg = Clang.Cursor_GetArgument(cursor, i);
+			let arg = Clang.Cursor_GetArgument(cursor, (.)i);
 			Type(Clang.GetCursorType(arg), IsOutParam(arg, cursor) ? .OutParam : .InParam);
 			str.Append(' ');
 			GetNameInBindings(arg, str);
@@ -659,16 +744,18 @@ abstract class Cpp2BeefGenerator
 		case .Standard:
 			str.Append(whitespace);
 			GetNameInBindings(cursor, str);
+			str.Append(templateParams);
 		case .TypeAlias:
 			String typeStr = scope .(str);
 			str.Set(whitespace);
 			GetNameInBindings(cursor, str);
-			str.Append(" = ", typeStr);
+			str.Append(templateParams, " = ", typeStr);
 		case .ConversionFunction:
 			String typeStr = scope .(str);
 			str.Clear();
-			str.Append("operator", whitespace, typeStr);
+			str.Append("operator", whitespace, typeStr, templateParams);
 		case .Ctor, .Dtor:
+			Runtime.Assert(templateParams.IsEmpty);
 			let originalLen = GetCursorSpelling!(cursor).Length;
 			StringView beefName = _ == .Ctor ? "this" : "Dispose";
 			int change = beefName.Length - originalLen;
@@ -680,7 +767,7 @@ abstract class Cpp2BeefGenerator
 		}
 	}
 
-	protected mixin ScopeTokenize(CXCursor cursor)
+	protected static mixin ScopeTokenize(CXCursor cursor, CXTranslationUnit unit)
 	{
 		let range = Clang.GetCursorExtent(cursor);
 		CXToken* tokenPtr = null; uint32 tokenCount = 0;
@@ -691,7 +778,7 @@ abstract class Cpp2BeefGenerator
 
 	protected virtual void WriteTokensAfterEquals(CXCursor cursor)
 	{
-		var tokens = ScopeTokenize!(cursor);
+		var tokens = ScopeTokenize!(cursor, unit);
 		CXSourceLocation prevEnd = Clang.GetNullLocation();
 		findEquals: do
 		{
@@ -815,6 +902,7 @@ abstract class Cpp2BeefGenerator
 			Clang.VisitChildren(cursor, (cursor, parent, client_data) =>
 			{
 				Self self = (.)Internal.UnsafeCastToObject(client_data);
+				self.WriteQueuedOpenSquirly();
 				self.WriteCursor(cursor, canChangeBlock: false);
 				return .Continue;
 			}, Internal.UnsafeCastToPtr(this));
@@ -827,7 +915,7 @@ abstract class Cpp2BeefGenerator
 		}
 	}
 
-	protected void WriteWrapperTypeWithIdentifier(CXType type, StringView identifier)
+	protected virtual void WriteWrapperTypeWithIdentifier(CXType type, StringView identifier)
 	{
 		wrapperBuf.Append("__type<");
 		wrapperBuf.Append(ScopeCXString!(Clang.GetFullyQualifiedName(type, printingPolicy, 0)));
@@ -905,7 +993,9 @@ abstract class Cpp2BeefGenerator
 		WriteTypeAndName(cursor, Clang.GetCursorResultType(cursor));
 		str.Append('(');
 		Method_Parameters(cursor);
-		str.Append(");");
+		str.Append(')');
+		str.Append(templateParamsWhere);
+		str.Append(';');
 	}
 
 	protected virtual void CXXMethod(CXCursor cursor) //TODO: conversion function
@@ -929,6 +1019,7 @@ abstract class Cpp2BeefGenerator
 		{
 			if (spelling == "operator[]")
 			{
+				Runtime.Assert(templateParams.IsEmpty, "Properties can't have generics");
 				AccessSpecifier(cursor);
 				if (Clang.CXXMethod_IsStatic(cursor) != 0) str.Append("static ");
 				str.Append("extern ");
@@ -949,7 +1040,9 @@ abstract class Cpp2BeefGenerator
 			str.Append("(in Self, ");
 			Method_Parameters(cursor);
 			if (str.EndsWith(", ")) str.Length -= 2;
-			str.Append(");");
+			str.Append(')');
+			str.Append(templateParamsWhere);
+			str.Append(';');
 			return;
 		}
 
@@ -971,6 +1064,7 @@ abstract class Cpp2BeefGenerator
 		str.Append(')');
 		if (Clang.CXXMethod_IsStatic(cursor) == 0 && Clang.CXXMethod_IsConst(cursor) == 0 && cursor.kind == .CXXMethod)
 			str.Append(" mut");
+		str.Append(templateParamsWhere);
 		str.Append(';');
 	}
 
@@ -1051,6 +1145,7 @@ abstract class Cpp2BeefGenerator
 		str.Append("struct ");
 		if (Clang.Cursor_IsAnonymous(cursor) == 0)
 			GetNameInBindings(cursor, str);
+		str.Append(templateParams);
 		Clang.VisitCXXMethods(Clang.GetCursorType(cursor), (cursor, client_data) =>
 		{
 			if (cursor.kind != .Destructor) return .Continue;
@@ -1059,6 +1154,7 @@ abstract class Cpp2BeefGenerator
 			return .Break;
 		}, Internal.UnsafeCastToPtr(str));
 
+		str.Append(templateParamsWhere);
 		BeginBody!(cursor);
 
 		bool firstBase = true;
@@ -1068,6 +1164,7 @@ abstract class Cpp2BeefGenerator
 			(Self self, bool* firstBase, bool hasVTable) = *(.)client_data;
 
 			Runtime.Assert(Clang.IsVirtualBase(cursor) == 0, "Virtual bases are not supported");
+			self.WriteQueuedOpenSquirly();
 			if (*firstBase && hasVTable && !HasVTable(Clang.GetCursorDefinition(cursor)))
 				self.str.Append(self.indent, "private void* cppVtable;\n");
 			self.str.Append(self.indent);
@@ -1086,6 +1183,7 @@ abstract class Cpp2BeefGenerator
 		Clang.VisitChildren(cursor, (cursor, parent, client_data) =>
 		{
 			Self self = (.)Internal.UnsafeCastToObject(client_data);
+			self.WriteQueuedOpenSquirly();
 			self.WriteCursor(cursor, canChangeBlock: false);
 			if (Clang.Cursor_IsAnonymousRecordDecl(cursor) != 0)
 				self.str..TrimEnd()..Append(";");
@@ -1099,6 +1197,7 @@ abstract class Cpp2BeefGenerator
 		str.Append("enum ");
 		if (Clang.Cursor_IsAnonymous(cursor) == 0)
 			GetNameInBindings(cursor, str);
+		str.Append(templateParams);
 		if (Clang.VisitChildren(cursor, (cursor, parent, client_data) =>
 			{
 				if (cursor.kind == .PackedAttr)
@@ -1108,6 +1207,7 @@ abstract class Cpp2BeefGenerator
 		{
 			str.Append(" : ");
 			Type(Clang.GetEnumDeclIntegerType(cursor));
+			str.Append(templateParamsWhere);
 		}	
 		BeginBody!(cursor);
 		Clang.VisitChildren(cursor, (cursor, parent, client_data) =>
@@ -1117,6 +1217,7 @@ abstract class Cpp2BeefGenerator
 
 			self.SingleLine(cursor);
 			self.WriteComments(cursor);
+			self.WriteQueuedOpenSquirly();
 			self.WriteCustomAttributes(cursor);
 			self.GetNameInBindings(cursor, self.str);
 			self.WriteTokensAfterEquals(cursor);
@@ -1147,6 +1248,7 @@ abstract class Cpp2BeefGenerator
 			str.Append("function ");
 			WriteTypeAndName(cursor, Clang.GetResultType(pointee));
 			WriteFunctionProtoParams(pointee);
+			str.Append(templateParamsWhere);
 			str.Append(';');
 			return;
 		}
@@ -1154,12 +1256,13 @@ abstract class Cpp2BeefGenerator
 		WriteCustomAttributes(cursor);
 		str.Append("typealias");
 		WriteTypeAndName(cursor, type, .TypeAlias);
+		Runtime.Assert(templateParamsWhere.IsEmpty, "type aliases can't have constraints (yet)");
 		str.Append(';');
 	}
 
 	protected virtual void MacroDefinition(CXCursor cursor)
 	{
-		let tokens = ScopeTokenize!(cursor);
+		let tokens = ScopeTokenize!(cursor, unit);
 		WriteCustomAttributes(cursor);
 		str.Append("public const let ");
 		GetNameInBindings(cursor, str);
